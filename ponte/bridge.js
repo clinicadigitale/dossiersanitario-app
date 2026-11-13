@@ -8,13 +8,17 @@
   const isMotore=u=>{try{const x=new URL(u,location.href);return x.port===PORTA||/^127\.0\.0\.1$|^localhost$/.test(x.hostname)&&x.port===PORTA;}catch(_e){return false;}};
   const base=(document.currentScript&&document.currentScript.src)?new URL('.',document.currentScript.src).href:new URL('ponte/',location.href).href;
   let worker=null,seq=0;const attese=new Map();let pronto=false;
+  const diretti=new Map();let seqDiretti=0;
+  function cloudDiretta(remote,op,dati){if(!worker||!pronto)return Promise.resolve({ok:false,code:'nonpronto',error:'Motore non pronto'});const id='c'+(++seqDiretti);return new Promise(r=>{diretti.set(id,r);const t=dati instanceof ArrayBuffer?[dati]:[];worker.postMessage({tipo:'cloudDiretta',id,remote,op,dati},t);});}
   function avvia(){
     if(worker)return worker;
     // Il motore parte da un piccolo avvio interno alla pagina: cosi' eredita sempre l'isolamento
     // della pagina (serve per usare piu' processori) senza dipendere dalle intestazioni del file.
-    const avvio=new Blob(["importScripts("+JSON.stringify(base+'engine-worker.js?v=web10')+");"],{type:'text/javascript'});
+    const avvio=new Blob(["importScripts("+JSON.stringify(base+'engine-worker.js?v=web16')+");"],{type:'text/javascript'});
     worker=new Worker(URL.createObjectURL(avvio));
     worker.onmessage=e=>{const m=e.data||{};
+      if(m.tipo==='cloudDiretta'){const d=diretti.get(m.id);if(d){diretti.delete(m.id);d(m.esito||{ok:false,error:'Risposta vuota'});}return;}
+      if(m.tipo==='cloudProgresso'){try{window.dispatchEvent(new CustomEvent('dossier-cloud-progresso',{detail:m}));}catch(_){}return;}
       if(m.tipo==='stato'){mostraStato(m.testo,m.fine,m.errore);if(m.fine)pronto=true;return;}
       const a=attese.get(m.id);if(!a)return;attese.delete(m.id);
       if(m.errore){a.reject(new TypeError('Motore del Dossier: '+m.errore));return;}
@@ -49,6 +53,8 @@
     if(!isMotore(url))return fetchOriginale(input,init);
     let req;try{req=new Request(url,init);}catch(e){return Promise.reject(e);}
     if(input instanceof Request&&!init)req=input;
+    // DICOM e immagini: gestiti dall'archivio media della webapp (ponte/media.js)
+    try{if(window.DossierMediaWeb&&new URL(req.url).pathname.startsWith('/api/media/'))return window.DossierMediaWeb.gestisci(req,chiedi);}catch(_e){}
     if(isPdf(req))return caratteriPerPdf().then(()=>chiedi(req));
     return chiedi(req);
   };
@@ -81,13 +87,34 @@
     const w=window.open(url,'dossier_google','width=520,height=680');
     if(!w){mostraStato('Il browser ha bloccato la finestra di Google. ',true,true);if(box){const a=document.createElement('a');a.href=url;a.target='dossier_google';a.textContent='Apri Google';a.style.cssText='color:#fff;text-decoration:underline;margin-left:6px';a.onclick=()=>setTimeout(()=>{box&&box.remove();box=null;},500);box.appendChild(a);}}
   }
+  // Sul telefono la scheda del Dossier resta sospesa mentre si e' nella scheda di Google:
+  // la pagina di ritorno lascia la risposta anche nella memoria del sito e il Dossier la
+  // completa appena si torna nella sua scheda.
+  const CHIAVE_RITORNO='dossierGoogleRitorno',ritorniGestiti=new Set();let canaleGoogle=null;
+  async function completaGoogle(q,daMemoria){
+    if(!q||ritorniGestiti.has(q))return;ritorniGestiti.add(q);
+    try{const v=JSON.parse(localStorage.getItem(CHIAVE_RITORNO)||'null');if(v&&v.q===q)localStorage.removeItem(CHIAVE_RITORNO);}catch(_e){}
+    if(daMemoria)mostraStato('Completamento del collegamento a Google Calendar…');
+    for(let i=0;i<240&&!pronto;i++)await new Promise(r=>setTimeout(r,500));
+    let ok=false,testo='';
+    try{const r=await window.fetch('http://127.0.0.1:'+PORTA+'/?'+q);ok=r.ok;testo=(await r.text()).replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();}catch(err){testo=String(err&&err.message||err);}
+    try{canaleGoogle&&canaleGoogle.postMessage({tipo:'esito',ok,testo});}catch(_e){}
+    if(daMemoria||!ok){mostraStato(ok?'Google Calendar collegato':'Collegamento a Google Calendar non riuscito: '+(testo||'riprova'),true,!ok);if(!ok)setTimeout(()=>{box&&box.remove();box=null;},8000);}
+    if(ok)setTimeout(()=>{try{document.querySelector('.nav-item.active')?.click();}catch(_e){}},300);
+  }
+  function controllaRitornoGoogle(){
+    if(document.visibilityState==='hidden')return;
+    let v=null;try{v=JSON.parse(localStorage.getItem(CHIAVE_RITORNO)||'null');}catch(_e){}
+    if(!v||!v.q)return;
+    if(Date.now()-Number(v.t||0)>600000){try{localStorage.removeItem(CHIAVE_RITORNO);}catch(_e){}return;}
+    void completaGoogle(v.q,true);
+  }
   try{
-    const canale=new BroadcastChannel('dossier-google-oauth');
-    canale.onmessage=async e=>{const q=e.data&&e.data.query;if(!q||e.data.tipo!=='ritorno')return;
-      let ok=false,testo='';
-      try{const r=await window.fetch('http://127.0.0.1:'+PORTA+'/?'+q);ok=r.ok;testo=(await r.text()).replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();}catch(err){testo=String(err&&err.message||err);}
-      canale.postMessage({tipo:'esito',ok,testo});};
+    canaleGoogle=new BroadcastChannel('dossier-google-oauth');
+    canaleGoogle.onmessage=e=>{const q=e.data&&e.data.query;if(!q||e.data.tipo!=='ritorno')return;void completaGoogle(q,false);};
   }catch(_e){}
+  document.addEventListener('visibilitychange',controllaRitornoGoogle);window.addEventListener('focus',controllaRitornoGoogle);
+  setInterval(controllaRitornoGoogle,3000);setTimeout(controllaRitornoGoogle,1000);
 
   // ---------------------------------------------------------------------
   // Avvisi del browser. Nell'exe li mostrano le Operazioni pianificate di
@@ -187,7 +214,9 @@
   function pulsantePermesso(){
     const ra=document.querySelector('.agenda-provider-strip .row-actions');if(!ra)return;
     const b=document.getElementById('ponteAttivaAvvisi');
-    if(permesso()==='granted'||permesso()==='unsupported'){if(b)b.remove();return;}
+    // sul telefono gli avvisi del browser arrivano solo a pagina aperta: il pulsante non si mostra
+    const telefono=(()=>{try{return !!window.FotoDocumento?.isTelefono?.();}catch(_e){return false;}})();
+    if(telefono||permesso()==='granted'||permesso()==='unsupported'){if(b)b.remove();return;}
     if(b)return;
     const n=document.createElement('button');n.type='button';n.id='ponteAttivaAvvisi';n.className='btn btn-primary btn-small';
     n.textContent=permesso()==='denied'?'Avvisi bloccati dal browser':'Attiva avvisi del browser';
@@ -259,6 +288,15 @@
     // i PDF creati dalle foto contengono solo immagini: i caratteri non servono
     return /\.pdf$/i.test(nome)&&!/^referto_(fotocamera|scanner)_/i.test(nome);}catch(_e){return false;}};
 
+  // Immagini servite dal motore (per esempio il QR del secondo fattore): un tag <img>
+  // non passa da fetch, quindi il ponte le scarica dal motore e le mostra da qui.
+  function immaginiMotore(radiceNodo){
+    const imgs=radiceNodo.querySelectorAll?radiceNodo.querySelectorAll('img[src*="127.0.0.1:'+PORTA+'"],img[src*="localhost:'+PORTA+'"]'):[];
+    imgs.forEach(img=>{const u=img.getAttribute('src');if(!u||img.dataset.ponte===u)return;img.dataset.ponte=u;
+      window.fetch(u).then(r=>r.ok?r.blob():Promise.reject(new Error(String(r.status)))).then(b=>{if(img.getAttribute('src')===u){img.dataset.ponte=URL.createObjectURL(b);img.src=img.dataset.ponte;}}).catch(()=>{});});
+  }
+  new MutationObserver(ms=>{for(const m of ms){if(m.type==='attributes')immaginiMotore(m.target.parentNode||document);else m.addedNodes.forEach(n=>{if(n.nodeType===1){if(n.tagName==='IMG')immaginiMotore(n.parentNode||document);else immaginiMotore(n);}});}}).observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['src']});
+
   let box=null;
   function mostraStato(testo,fine,errore){
     if(!box){box=document.createElement('div');box.style.cssText='position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:99999;background:#14243a;color:#fff;padding:12px 18px;border-radius:12px;font:600 13px Segoe UI,system-ui,sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.25);max-width:90vw';(document.body||document.documentElement).appendChild(box);}
@@ -267,5 +305,19 @@
   }
   document.addEventListener('DOMContentLoaded',()=>{if(!pronto)mostraStato('Preparazione del motore del Dossier nel browser…');});
   avvia();
-  window.DossierPonteWeb={pronto:()=>pronto};
+  // Chiede al browser di non cancellare mai da solo i dati del Dossier (senza, Chrome su telefono li puo' eliminare quando gli serve spazio).
+  let memoriaPermanente=null;
+  async function chiediMemoriaPermanente(){
+    try{
+      if(!navigator.storage?.persist)return null;
+      if(await navigator.storage.persisted())return memoriaPermanente=true;
+      memoriaPermanente=await navigator.storage.persist();
+      if(!memoriaPermanente)console.warn('Memoria permanente non concessa dal browser: i dati potrebbero essere cancellati se il dispositivo resta senza spazio.');
+      return memoriaPermanente;
+    }catch(_e){return null;}
+  }
+  void chiediMemoriaPermanente();setTimeout(()=>{if(memoriaPermanente!==true)void chiediMemoriaPermanente();},120000);
+  window.addEventListener('dossier-unlocked',()=>{if(memoriaPermanente!==true)void chiediMemoriaPermanente();});
+  window.addEventListener('appinstalled',()=>{void chiediMemoriaPermanente();});
+  window.DossierPonteWeb={pronto:()=>pronto,cloudDiretta,memoriaPermanente:()=>memoriaPermanente,chiediMemoriaPermanente};
 })();
